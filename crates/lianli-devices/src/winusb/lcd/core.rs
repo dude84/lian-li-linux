@@ -571,12 +571,30 @@ const CONTROL_SAFE_LEVEL: u8 = 1;
 /// waited `CONTROL_RELAX_AFTER`.
 const CONTROL_RELAXED_LEVEL: u8 = 2;
 const CONTROL_RELAX_AFTER: Duration = Duration::from_secs(3);
+/// Last rung for play-safe commands when the panel never drains below 3.
+/// The HS II firmware reverts the pump to its own ~2250 RPM after roughly
+/// 6-7 s without SyncPumpFan; a stream parked at level 3 used to hold the
+/// queued command for minutes (121 s observed), so the pump hunted.
+const CONTROL_LAST_RUNG_LEVEL: u8 = 3;
+const CONTROL_LAST_RUNG_AFTER: Duration = Duration::from_millis(4_500);
 /// L-Connect polls every 7th tick of its 330 ms loop, at any buffer level.
 const STREAM_TELEMETRY_INTERVAL: Duration = Duration::from_millis(2_310);
 const TELEMETRY_REQUEST_WINDOW: Duration = Duration::from_secs(5);
 /// One tick of L-Connect's 330 ms message loop.
 const STREAM_TELEMETRY_RETRY: Duration = Duration::from_millis(330);
 const STREAM_TELEMETRY_SECOND_READ: Duration = Duration::from_millis(200);
+
+/// Whether queued play-safe control commands may go out at this buffer level,
+/// given how long the oldest has waited.
+fn deferred_control_safe(level: Option<u8>, oldest_age: Option<Duration>) -> bool {
+    let waited = |min: Duration| oldest_age.is_some_and(|age| age >= min);
+    match level {
+        Some(l) if l <= CONTROL_SAFE_LEVEL => true,
+        Some(l) if l <= CONTROL_RELAXED_LEVEL => waited(CONTROL_RELAX_AFTER),
+        Some(l) if l <= CONTROL_LAST_RUNG_LEVEL => waited(CONTROL_LAST_RUNG_AFTER),
+        _ => false,
+    }
+}
 
 const REOPEN_DELAY: Duration = Duration::from_millis(100);
 /// Gap between the wake-preamble commands (StopPlay, StopClock, GetVer).
@@ -1329,15 +1347,7 @@ impl WinUsbLcdCore {
         if !self.transport.has_play_safe_pending() {
             return;
         }
-        let safe = match level {
-            Some(l) if l <= CONTROL_SAFE_LEVEL => true,
-            Some(l) if l <= CONTROL_RELAXED_LEVEL => self
-                .transport
-                .oldest_play_safe_age()
-                .is_some_and(|age| age >= CONTROL_RELAX_AFTER),
-            _ => false,
-        };
-        if !safe {
+        if !deferred_control_safe(level, self.transport.oldest_play_safe_age()) {
             return;
         }
         for cmd in self.transport.take_play_safe() {
@@ -1905,6 +1915,37 @@ fn flex_opening_packets(builder: &mut PacketBuilder, screen: &ScreenInfo) -> Res
         framed(builder.jpeg_header_winusb(jpeg.len()), &jpeg),
         framed(builder.flex_l3_layer_header_winusb(l3.len(), 0, 0), &l3),
     ])
+}
+
+#[cfg(test)]
+mod deferred_control_tests {
+    use super::{deferred_control_safe, CONTROL_LAST_RUNG_AFTER, CONTROL_RELAX_AFTER};
+    use std::time::Duration;
+
+    #[test]
+    fn level_three_only_after_the_last_rung_wait() {
+        let ms = Duration::from_millis;
+        assert!(deferred_control_safe(Some(1), Some(ms(0))));
+        assert!(!deferred_control_safe(
+            Some(2),
+            Some(CONTROL_RELAX_AFTER - ms(1))
+        ));
+        assert!(deferred_control_safe(Some(2), Some(CONTROL_RELAX_AFTER)));
+        assert!(!deferred_control_safe(
+            Some(3),
+            Some(CONTROL_LAST_RUNG_AFTER - ms(1))
+        ));
+        assert!(deferred_control_safe(
+            Some(3),
+            Some(CONTROL_LAST_RUNG_AFTER)
+        ));
+        assert!(!deferred_control_safe(
+            Some(4),
+            Some(Duration::from_secs(60))
+        ));
+        assert!(!deferred_control_safe(None, Some(Duration::from_secs(60))));
+        assert!(!deferred_control_safe(Some(3), None));
+    }
 }
 
 #[cfg(test)]

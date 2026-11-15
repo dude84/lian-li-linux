@@ -472,9 +472,17 @@ impl H2AioController {
         }
         // Firmware wedges under frequent writes; retain its 3.6s refresh cadence.
         // A rising full-speed target must bypass the jitter deadband for safety.
-        if self.last_sync.lock().is_some_and(|(at, pump, fans)| {
-            !pwm_refresh_due(at.elapsed(), pump, fans, pump_duty, fan_duties)
-        }) {
+        // While the LCD streams, keep a command queued instead: the stream
+        // thread coalesces it (latest wins, original queue time kept) and puts
+        // it on the wire no more often than the panel allows, while the 3.6 s
+        // stamp taken at defer time would add to that wait and push the gap
+        // past the firmware's ~6-7 s fallback to its own pump speed.
+        let streaming = self.transport.is_streaming();
+        if !streaming
+            && self.last_sync.lock().is_some_and(|(at, pump, fans)| {
+                !pwm_refresh_due(at.elapsed(), pump, fans, pump_duty, fan_duties)
+            })
+        {
             return Ok(());
         }
         let pump_pwm = self.duty_to_pwm(pump_duty);
